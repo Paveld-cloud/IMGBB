@@ -29,11 +29,11 @@ if not BOT_TOKEN:
 if not IMGBB_API_KEY:
     log.warning("IMGBB_API_KEY не задан — основной провайдер работать не будет")
 
-# лимиты/настройки
+# ---------- НАСТРОЙКИ / ЛИМИТЫ ----------
 IMGBB_MAX_BYTES = 32 * 1024 * 1024
-TELEGRAPH_MAX_BYTES = 5 * 1024 * 1024  # лимит telegra.ph
-MAX_SIDE_PX = 1600                     # даунскейл для скорости/стабильности
-JPEG_QUALITY = 75
+TELEGRAPH_MAX_BYTES = int(4.7 * 1024 * 1024)  # держим запас < ~4.7МБ
+MAX_SIDE_PX = 1400                             # даунскейл для скорости/стабильности
+JPEG_QUALITY = 70                              # чуть сильнее сжатие
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{2,64}$")
 
 # ---------- УТИЛИТЫ/КОДЕКИ ----------
@@ -122,9 +122,38 @@ async def upload_with_retries_imgbb(image_bytes: bytes, name: str, max_attempts:
     raise RuntimeError(f"IMGBB отказал после {max_attempts} попыток: {last_exc}")
 
 # ---------- TELEGRAPH (фоллбэк) ----------
+def fit_under_telegraph_limit(original_bytes: bytes) -> Tuple[bytes, str]:
+    """
+    Агрессивно подгоняем под лимит ~4.7 МБ.
+    Сначала JPEG с понижением max_side/качества.
+    Если не вышло — пробуем PNG с сильным даунскейлом.
+    """
+    jpeg_steps = [
+        (1400, 70),
+        (1200, 70),
+        (1200, 65),
+        (1000, 65),
+        (1000, 60),
+        (900, 60),
+        (800, 60),
+    ]
+    for side, q in jpeg_steps:
+        jpeg = encode_jpeg(original_bytes, max_side=side, quality=q)
+        if len(jpeg) <= TELEGRAPH_MAX_BYTES:
+            return jpeg, "jpg"
+
+    for side in (1200, 1000, 800):
+        png = encode_png(original_bytes, max_side=side)
+        if len(png) <= TELEGRAPH_MAX_BYTES:
+            return png, "png"
+
+    # Вернём самый маленький JPEG, пусть сервер решит
+    return encode_jpeg(original_bytes, max_side=800, quality=60), "jpg"
+
 async def upload_to_telegraph(image_bytes: bytes, ext: str = "jpg") -> str:
     """
-    Загружает файл в Telegraph (лимит ~5 МБ). Возвращает полный URL.
+    Загружает файл в Telegraph. Возвращает полный URL.
+    Используем безопасный content-type и нормальное имя файла.
     """
     url = "https://telegra.ph/upload"
     form = aiohttp.FormData()
@@ -132,9 +161,10 @@ async def upload_to_telegraph(image_bytes: bytes, ext: str = "jpg") -> str:
         "file",
         image_bytes,
         filename=f"file.{ext}",
-        content_type=f"image/{'jpeg' if ext=='jpg' else ext}"
+        content_type="application/octet-stream"  # безопаснее, чем image/*
     )
-    async with aiohttp.ClientSession() as session:
+    headers = {"User-Agent": "Mozilla/5.0 (compatible)"}
+    async with aiohttp.ClientSession(headers=headers) as session:
         async with session.post(url, data=form, timeout=60) as resp:
             txt = await resp.text()
             log.info("telegraph response (status %s): %s", resp.status, txt[:300])
@@ -145,26 +175,24 @@ async def upload_to_telegraph(image_bytes: bytes, ext: str = "jpg") -> str:
             if resp.status != 200:
                 raise RuntimeError(f"Telegraph HTTP {resp.status}: {payload}")
             if not isinstance(payload, list) or not payload or "src" not in payload[0]:
-                raise RuntimeError(f"Telegraph странный ответ: {payload}")
-            src = payload[0]["src"]  # типа "/file/abcd.jpg"
+                err = payload.get("error") if isinstance(payload, dict) else payload
+                raise RuntimeError(f"Telegraph странный ответ: {err}")
+            src = payload[0]["src"]  # вида "/file/abcd.jpg"
             return f"https://telegra.ph{src}"
 
-def fit_under_telegraph_limit(original_bytes: bytes) -> Tuple[bytes, str]:
-    """
-    Укладываемся < 5 МБ: пытаемся JPEG с понижением качества/размера.
-    Возвращает (bytes, 'jpg'|'png').
-    """
-    jpeg = encode_jpeg(original_bytes, max_side=MAX_SIDE_PX, quality=JPEG_QUALITY)
-    if len(jpeg) <= TELEGRAPH_MAX_BYTES:
-        return jpeg, "jpg"
-    # сильнее ужимаем
-    for q in (70, 65, 60, 55):
-        jpeg = encode_jpeg(original_bytes, max_side=1400, quality=q)
-        if len(jpeg) <= TELEGRAPH_MAX_BYTES:
-            return jpeg, "jpg"
-    # последняя попытка — PNG (не всегда меньше)
-    png = encode_png(original_bytes, max_side=1200)
-    return (png, "png") if len(png) <= TELEGRAPH_MAX_BYTES else (jpeg, "jpg")
+async def upload_to_telegraph_with_retries(image_bytes: bytes, ext: str, max_attempts: int = 3) -> str:
+    """Ретраим Telegraph, если бывают 400/500/Unknown error."""
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            log.info("TELEGRAPH: попытка %d/%d", attempt, max_attempts)
+            return await upload_to_telegraph(image_bytes, ext=ext)
+        except Exception as e:
+            last_exc = e
+            if attempt == max_attempts:
+                break
+            await asyncio.sleep(1.5 * attempt)  # 1.5s, 3s
+    raise RuntimeError(f"Telegraph отказал после {max_attempts} попыток: {last_exc}")
 
 # ---------- КОМАНДЫ ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -206,7 +234,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Если есть pending_image — сначала IMGBB (JPEG), при неудаче — Telegraph.
-    В ссылке Telegraph добавляю ?code=ID, чтобы твой код был в URL.
+    В ссылке Telegraph добавляем ?code=ID, чтобы твой код был в URL.
     """
     pending = context.user_data.get("pending_image")
     if not pending:
@@ -240,10 +268,10 @@ async def handle_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         fitted_bytes, ext = fit_under_telegraph_limit(pending)
         if len(fitted_bytes) > TELEGRAPH_MAX_BYTES:
-            raise RuntimeError("Не удалось ужать файл до 5 МБ для Telegraph")
-        t_url = await upload_to_telegraph(fitted_bytes, ext=ext)
+            raise RuntimeError("Не удалось ужать файл до ~5 МБ для Telegraph")
+        t_url = await upload_to_telegraph_with_retries(fitted_bytes, ext=ext, max_attempts=3)
         context.user_data.pop("pending_image", None)
-        t_url_with_code = f"{t_url}?code={the_id}"   # добавляем ID в URL
+        t_url_with_code = f"{t_url}?code={the_id}"
         await update.message.reply_text(
             f"✅ Telegraph (фоллбэк)\nПрямая ссылка: {t_url_with_code}\nФайл: {the_id}.{ext}"
         )

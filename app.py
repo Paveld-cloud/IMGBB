@@ -146,9 +146,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-        log.info("Старт в режиме polling")
-        app.run_polling(allowed_updates=["message"])
-
-if __name__ == "__main__":
-    main()

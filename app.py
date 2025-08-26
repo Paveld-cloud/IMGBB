@@ -5,7 +5,7 @@ import base64
 import json
 import logging
 import asyncio
-from typing import Optional, Tuple
+from typing import Optional
 
 import aiohttp
 from PIL import Image
@@ -29,177 +29,92 @@ if not BOT_TOKEN:
 if not IMGBB_API_KEY:
     log.warning("IMGBB_API_KEY не задан — основной провайдер работать не будет")
 
-# ---------- НАСТРОЙКИ / ЛИМИТЫ ----------
+# ---------- НАСТРОЙКИ ----------
 IMGBB_MAX_BYTES = 32 * 1024 * 1024
-TELEGRAPH_MAX_BYTES = int(4.7 * 1024 * 1024)  # держим запас < ~4.7МБ
-MAX_SIDE_PX = 1400                             # даунскейл для скорости/стабильности
-JPEG_QUALITY = 70                              # чуть сильнее сжатие
+TELEGRAPH_MAX_BYTES = int(4.7 * 1024 * 1024)  # лимит telegra.ph ~5 МБ
+MAX_SIDE_PX = 1600
+JPEG_QUALITY = 75
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{2,64}$")
 
-# ---------- УТИЛИТЫ/КОДЕКИ ----------
+# ---------- УТИЛИТЫ ----------
 def sanitize_id(s: str) -> Optional[str]:
     s = (s or "").strip()
     return s if ID_RE.match(s) else None
 
-def _open_image(original_bytes: bytes) -> Image.Image:
+def to_clean_jpeg(original_bytes: bytes, max_side: int = 1000, quality: int = 80) -> bytes:
+    """Превращает любую картинку в «чистый» JPEG (RGB, без EXIF)."""
     im = Image.open(io.BytesIO(original_bytes))
-    try:
-        im.load()
-    except Exception:
-        pass
-    return im
-
-def _downscale(im: Image.Image, max_side: int = MAX_SIDE_PX) -> Image.Image:
+    im = im.convert("RGB")
     w, h = im.size
-    if max(w, h) <= max_side:
-        return im
-    if w >= h:
-        new_w = max_side
-        new_h = int(h * (max_side / w))
-    else:
-        new_h = max_side
-        new_w = int(w * (max_side / h))
-    return im.resize((new_w, new_h), Image.LANCZOS)
-
-def encode_png(original_bytes: bytes, max_side: int = MAX_SIDE_PX) -> bytes:
-    im = _open_image(original_bytes)
-    im = _downscale(im, max_side)
-    if im.mode not in ("RGB", "RGBA", "P", "L"):
-        im = im.convert("RGBA")
+    if max(w, h) > max_side:
+        if w >= h:
+            new_w = max_side
+            new_h = int(h * (max_side / w))
+        else:
+            new_h = max_side
+            new_w = int(w * (max_side / h))
+        im = im.resize((new_w, new_h), Image.LANCZOS)
     out = io.BytesIO()
-    im.save(out, format="PNG")
+    im.save(out, format="JPEG", quality=quality, optimize=True)
     return out.getvalue()
 
 def encode_jpeg(original_bytes: bytes, max_side: int = MAX_SIDE_PX, quality: int = JPEG_QUALITY) -> bytes:
-    im = _open_image(original_bytes)
-    im = _downscale(im, max_side)
+    im = Image.open(io.BytesIO(original_bytes))
     if im.mode not in ("RGB", "L"):
         im = im.convert("RGB")
+    w, h = im.size
+    if max(w, h) > max_side:
+        if w >= h:
+            new_w = max_side
+            new_h = int(h * (max_side / w))
+        else:
+            new_h = max_side
+            new_w = int(w * (max_side / h))
+        im = im.resize((new_w, new_h), Image.LANCZOS)
     out = io.BytesIO()
     im.save(out, format="JPEG", quality=quality, optimize=True)
     return out.getvalue()
 
 # ---------- IMGBB ----------
-async def upload_to_imgbb(image_bytes: bytes, name: str, timeout_s: int = 120) -> dict:
-    """Одна попытка загрузки в imgbb."""
+async def upload_to_imgbb(image_bytes: bytes, name: str) -> dict:
     if not IMGBB_API_KEY:
         raise RuntimeError("IMGBB_API_KEY не задан")
     b64_str = base64.b64encode(image_bytes).decode("utf-8")
     url = "https://api.imgbb.com/1/upload"
     data = {"key": IMGBB_API_KEY, "image": b64_str, "name": name}
-
     async with aiohttp.ClientSession() as session:
-        async with session.post(url, data=data, timeout=timeout_s) as resp:
+        async with session.post(url, data=data, timeout=90) as resp:
             txt = await resp.text()
-            log.info("imgbb response (status %s): %s", resp.status, txt[:500])
-            try:
-                payload = json.loads(txt)
-            except json.JSONDecodeError:
-                raise RuntimeError(f"imgbb вернул не-JSON. Ответ: {txt[:200]}")
+            log.info("imgbb response (status %s): %s", resp.status, txt[:200])
+            payload = json.loads(txt)
             if resp.status != 200 or not payload.get("success"):
-                err = payload.get("error") or {}
-                raise RuntimeError(f"Ошибка imgbb: {err or payload}")
+                raise RuntimeError(f"Ошибка imgbb: {payload}")
             return payload["data"]
 
-async def upload_with_retries_imgbb(image_bytes: bytes, name: str, max_attempts: int = 2) -> dict:
-    """Повторная загрузка в imgbb с бэкоффом."""
-    attempt = 0
-    last_exc = None
-    while attempt < max_attempts:
-        attempt += 1
-        try:
-            log.info("IMGBB: попытка %d/%d (%s)", attempt, max_attempts, name)
-            return await upload_to_imgbb(image_bytes, name, timeout_s=90)
-        except Exception as e:
-            last_exc = e
-            msg = str(e)
-            retryable = any(code in msg for code in ["504", "503", "502", "500", "429"]) or "не-JSON" in msg or "Client" in msg
-            if attempt >= max_attempts or not retryable:
-                break
-            sleep_s = 2 * attempt  # 2, 4
-            log.warning("IMGBB ошибка (попытка %d): %s. Повтор через %ss", attempt, e, sleep_s)
-            await asyncio.sleep(sleep_s)
-    raise RuntimeError(f"IMGBB отказал после {max_attempts} попыток: {last_exc}")
-
-# ---------- TELEGRAPH (фоллбэк) ----------
-def fit_under_telegraph_limit(original_bytes: bytes) -> Tuple[bytes, str]:
-    """
-    Агрессивно подгоняем под лимит ~4.7 МБ.
-    Сначала JPEG с понижением max_side/качества.
-    Если не вышло — пробуем PNG с сильным даунскейлом.
-    """
-    jpeg_steps = [
-        (1400, 70),
-        (1200, 70),
-        (1200, 65),
-        (1000, 65),
-        (1000, 60),
-        (900, 60),
-        (800, 60),
-    ]
-    for side, q in jpeg_steps:
-        jpeg = encode_jpeg(original_bytes, max_side=side, quality=q)
-        if len(jpeg) <= TELEGRAPH_MAX_BYTES:
-            return jpeg, "jpg"
-
-    for side in (1200, 1000, 800):
-        png = encode_png(original_bytes, max_side=side)
-        if len(png) <= TELEGRAPH_MAX_BYTES:
-            return png, "png"
-
-    # Вернём самый маленький JPEG, пусть сервер решит
-    return encode_jpeg(original_bytes, max_side=800, quality=60), "jpg"
-
-async def upload_to_telegraph(image_bytes: bytes, ext: str = "jpg") -> str:
-    """
-    Загружает файл в Telegraph. Возвращает полный URL.
-    Используем безопасный content-type и нормальное имя файла.
-    """
+# ---------- TELEGRAPH ----------
+async def upload_to_telegraph(image_bytes: bytes) -> str:
     url = "https://telegra.ph/upload"
     form = aiohttp.FormData()
-    form.add_field(
-        "file",
-        image_bytes,
-        filename=f"file.{ext}",
-        content_type="application/octet-stream"  # безопаснее, чем image/*
-    )
-    headers = {"User-Agent": "Mozilla/5.0 (compatible)"}
-    async with aiohttp.ClientSession(headers=headers) as session:
-        async with session.post(url, data=form, timeout=60) as resp:
+    form.add_field("file", image_bytes, filename="file.jpg", content_type="application/octet-stream")
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, data=form, timeout=30) as resp:
             txt = await resp.text()
-            log.info("telegraph response (status %s): %s", resp.status, txt[:300])
+            log.info("telegraph response (status %s): %s", resp.status, txt[:200])
             try:
                 payload = json.loads(txt)
-            except json.JSONDecodeError:
-                raise RuntimeError(f"Telegraph вернул не-JSON: {txt[:200]}")
-            if resp.status != 200:
+            except:
+                raise RuntimeError(f"Telegraph не JSON: {txt}")
+            if resp.status != 200 or not isinstance(payload, list):
                 raise RuntimeError(f"Telegraph HTTP {resp.status}: {payload}")
-            if not isinstance(payload, list) or not payload or "src" not in payload[0]:
-                err = payload.get("error") if isinstance(payload, dict) else payload
-                raise RuntimeError(f"Telegraph странный ответ: {err}")
-            src = payload[0]["src"]  # вида "/file/abcd.jpg"
+            src = payload[0]["src"]
             return f"https://telegra.ph{src}"
-
-async def upload_to_telegraph_with_retries(image_bytes: bytes, ext: str, max_attempts: int = 3) -> str:
-    """Ретраим Telegraph, если бывают 400/500/Unknown error."""
-    last_exc = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            log.info("TELEGRAPH: попытка %d/%d", attempt, max_attempts)
-            return await upload_to_telegraph(image_bytes, ext=ext)
-        except Exception as e:
-            last_exc = e
-            if attempt == max_attempts:
-                break
-            await asyncio.sleep(1.5 * attempt)  # 1.5s, 3s
-    raise RuntimeError(f"Telegraph отказал после {max_attempts} попыток: {last_exc}")
 
 # ---------- КОМАНДЫ ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! Отправь картинку, затем введи ID (например UZ001450). "
-        "Сначала попробую загрузить в imgbb (.jpg), при проблемах — в Telegraph.\n\n"
-        "/cancel — отменить ожидание кода."
+        "Привет! Отправь картинку, потом введи ID (например UZ001450).\n"
+        "Сначала попробую загрузить в ImgBB, если не получится — в Telegraph.\n"
+        "/cancel — отменить."
     )
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -208,79 +123,54 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- ОБРАБОТЧИКИ ----------
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Принимаем картинку → сохраняем байты → просим ввести ID."""
     message = update.message
     tg_file = None
-
     if message.photo:
         tg_file = await message.photo[-1].get_file()
-    elif message.document and message.document.mime_type and message.document.mime_type.startswith("image/"):
+    elif message.document and message.document.mime_type.startswith("image/"):
         tg_file = await message.document.get_file()
-
     if not tg_file:
         return
-
     buf = io.BytesIO()
     await tg_file.download_to_memory(out=buf)
-    image_bytes = buf.getvalue()
-
-    if len(image_bytes) > IMGBB_MAX_BYTES:
-        await message.reply_text("❌ Файл больше 32 МБ. Сожми изображение и попробуй снова.")
-        return
-
-    context.user_data["pending_image"] = image_bytes
-    await message.reply_text("Картинка получена ✅. Теперь введи ID (например UZ001450).")
+    context.user_data["pending_image"] = buf.getvalue()
+    await message.reply_text("Картинка получена ✅. Теперь введи ID.")
 
 async def handle_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Если есть pending_image — сначала IMGBB (JPEG), при неудаче — Telegraph.
-    В ссылке Telegraph добавляем ?code=ID, чтобы твой код был в URL.
-    """
     pending = context.user_data.get("pending_image")
     if not pending:
         return
-
     the_id = sanitize_id(update.message.text)
     if not the_id:
-        await update.message.reply_text("❌ Некорректный ID. Разрешены буквы/цифры/`_`/`-` (2–64 символа).")
+        await update.message.reply_text("❌ Некорректный ID")
         return
-
     await update.message.reply_text("Загружаю…")
 
-    # --- 1) Пытаемся IMGBB (JPEG) быстро и компактно ---
+    # 1) Пробуем IMGBB
     try:
-        jpeg_bytes = encode_jpeg(pending, max_side=MAX_SIDE_PX, quality=JPEG_QUALITY)
-        if len(jpeg_bytes) > IMGBB_MAX_BYTES:
-            raise RuntimeError("JPEG > 32 МБ")
-        data = await upload_with_retries_imgbb(jpeg_bytes, name=f"{the_id}.jpg", max_attempts=2)
+        jpeg_bytes = encode_jpeg(pending)
+        data = await upload_to_imgbb(jpeg_bytes, name=f"{the_id}.jpg")
         context.user_data.pop("pending_image", None)
         url = data.get("url")
-        size = data.get("size")
-        await update.message.reply_text(
-            (f"✅ IMGBB\nПрямая ссылка: {url}\nФайл: {the_id}.jpg\nРазмер: {size} байт")
-            if size else (f"✅ IMGBB\nПрямая ссылка: {url}\nФайл: {the_id}.jpg")
-        )
+        await update.message.reply_text(f"✅ ImgBB\n{url}\nФайл: {the_id}.jpg")
         return
     except Exception as e:
-        log.warning("IMGBB недоступен, переходим на Telegraph: %s", e)
+        log.warning("IMGBB ошибка: %s", e)
 
-    # --- 2) Фоллбэк: Telegraph ---
+    # 2) Пробуем Telegraph (жёсткий JPEG)
     try:
-        fitted_bytes, ext = fit_under_telegraph_limit(pending)
-        if len(fitted_bytes) > TELEGRAPH_MAX_BYTES:
-            raise RuntimeError("Не удалось ужать файл до ~5 МБ для Telegraph")
-        t_url = await upload_to_telegraph_with_retries(fitted_bytes, ext=ext, max_attempts=3)
+        clean_jpeg = to_clean_jpeg(pending, max_side=1000, quality=80)
+        if len(clean_jpeg) > TELEGRAPH_MAX_BYTES:
+            raise RuntimeError("Слишком большой файл для Telegraph")
+        t_url = await upload_to_telegraph(clean_jpeg)
         context.user_data.pop("pending_image", None)
-        t_url_with_code = f"{t_url}?code={the_id}"
-        await update.message.reply_text(
-            f"✅ Telegraph (фоллбэк)\nПрямая ссылка: {t_url_with_code}\nФайл: {the_id}.{ext}"
-        )
+        await update.message.reply_text(f"✅ Telegraph\n{t_url}?code={the_id}")
         return
     except Exception as e:
         context.user_data.pop("pending_image", None)
-        await update.message.reply_text(f"❌ Не удалось загрузить ни в imgbb, ни в Telegraph: {e}")
+        await update.message.reply_text(f"❌ Не удалось загрузить ни в ImgBB, ни в Telegraph: {e}")
 
-# ---------- СБОРКА ----------
+# ---------- MAIN ----------
 def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -292,15 +182,11 @@ def build_app() -> Application:
 def main():
     app = build_app()
     if WEBHOOK_URL:
-        log.info("Старт в режиме webhook на порту %s", PORT)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=f"/{BOT_TOKEN}",
-            webhook_url=f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
-        )
+        log.info("Webhook mode")
+        app.run_webhook(listen="0.0.0.0", port=PORT, url_path=f"/{BOT_TOKEN}",
+                        webhook_url=f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}")
     else:
-        log.info("Старт в режиме polling")
+        log.info("Polling mode")
         app.run_polling()
 
 if __name__ == "__main__":

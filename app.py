@@ -5,7 +5,7 @@ import base64
 import json
 import logging
 import asyncio
-from typing import Optional, Tuple
+from typing import Optional
 
 import aiohttp
 from PIL import Image
@@ -29,10 +29,9 @@ if not BOT_TOKEN:
 if not IMGBB_API_KEY:
     raise RuntimeError("Не задана переменная окружения IMGBB_API_KEY")
 
-# лимиты
+# лимиты/настройки
 IMGBB_MAX_BYTES = 32 * 1024 * 1024
-MAX_SIDE_PX = 4096  # даунскейл больших изображений
-
+MAX_SIDE_PX = 2048  # было 4096 — уменьшаем, чтобы ускорить и снизить ошибки 504
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{2,64}$")
 
 # ---------- УТИЛИТЫ ----------
@@ -61,7 +60,7 @@ def _downscale(im: Image.Image, max_side: int = MAX_SIDE_PX) -> Image.Image:
     return im.resize((new_w, new_h), Image.LANCZOS)
 
 def encode_png(original_bytes: bytes, max_side: int = MAX_SIDE_PX) -> bytes:
-    """Конвертирует в PNG, даунскейлит до max_side."""
+    """Конвертирует в PNG с даунскейлом до max_side."""
     im = _open_image(original_bytes)
     im = _downscale(im, max_side)
     if im.mode not in ("RGB", "RGBA", "P", "L"):
@@ -70,8 +69,8 @@ def encode_png(original_bytes: bytes, max_side: int = MAX_SIDE_PX) -> bytes:
     im.save(out, format="PNG")
     return out.getvalue()
 
-def encode_jpeg(original_bytes: bytes, max_side: int = MAX_SIDE_PX, quality: int = 85) -> bytes:
-    """Конвертирует в JPEG с даунскейлом и умеренным качеством (для облегчения)."""
+def encode_jpeg(original_bytes: bytes, max_side: int = MAX_SIDE_PX, quality: int = 80) -> bytes:
+    """Конвертирует в JPEG с даунскейлом и умеренным качеством."""
     im = _open_image(original_bytes)
     im = _downscale(im, max_side)
     if im.mode not in ("RGB", "L"):
@@ -105,7 +104,7 @@ async def upload_to_imgbb(image_bytes: bytes, name: str, timeout_s: int = 300) -
             return payload["data"]
 
 async def upload_with_retries(image_bytes: bytes, name: str, max_attempts: int = 3) -> dict:
-    """Повторная загрузка с экспоненциальной паузой при 5xx/сетевых ошибках/429."""
+    """Повторная загрузка с бэкофом при 5xx/429/сетевых ошибках или не-JSON ответе."""
     attempt = 0
     last_exc = None
     while attempt < max_attempts:
@@ -116,7 +115,6 @@ async def upload_with_retries(image_bytes: bytes, name: str, max_attempts: int =
         except Exception as e:
             last_exc = e
             msg = str(e)
-            # Решаем — стоит ли ретраить
             retryable = any(code in msg for code in ["504", "503", "502", "500", "429"]) or "не-JSON" in msg or "Client" in msg
             if attempt >= max_attempts or not retryable:
                 break
@@ -163,7 +161,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text("Картинка получена ✅. Теперь введи ID (например UZ001450).")
 
 async def handle_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Если есть pending_image, трактуем текст как ID → PNG попытка → при неудаче JPEG попытка."""
+    """Если есть pending_image — сначала JPEG (быстрее/меньше), при необходимости PNG."""
     pending = context.user_data.get("pending_image")
     if not pending:
         return
@@ -173,37 +171,9 @@ async def handle_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Некорректный ID. Разрешены буквы/цифры/`_`/`-` (2–64 символа).")
         return
 
-    # --- Готовим PNG (даунскейл до 4096px) ---
+    # --- Сначала пробуем JPEG ---
     try:
-        png_bytes = encode_png(pending, max_side=MAX_SIDE_PX)
-    except Exception as e:
-        log.exception("Ошибка конвертации в PNG")
-        await update.message.reply_text(f"❌ Не удалось конвертировать в PNG: {e}")
-        context.user_data.pop("pending_image", None)
-        return
-
-    if len(png_bytes) > IMGBB_MAX_BYTES:
-        await update.message.reply_text("❌ После конвертации PNG > 32 МБ. Попробуем JPEG автоматически.")
-        png_bytes = None  # не будем пытаться PNG
-
-    # --- Сначала пробуем PNG с ретраями ---
-    if png_bytes:
-        try:
-            data = await upload_with_retries(png_bytes, name=f"{the_id}.png", max_attempts=3)
-            context.user_data.pop("pending_image", None)
-            url = data.get("url")
-            size = data.get("size")
-            await update.message.reply_text(
-                (f"✅ Загружено!\nПрямая ссылка: {url}\nФайл: {the_id}.png\nРазмер: {size} байт")
-                if size else (f"✅ Загружено!\nПрямая ссылка: {url}\nФайл: {the_id}.png")
-            )
-            return
-        except Exception as e:
-            log.warning("PNG не удался, попробуем JPEG. Причина: %s", e)
-
-    # --- Фоллбэк: пробуем JPEG (обычно меньше) ---
-    try:
-        jpeg_bytes = encode_jpeg(pending, max_side=MAX_SIDE_PX, quality=85)
+        jpeg_bytes = encode_jpeg(pending, max_side=MAX_SIDE_PX, quality=80)
     except Exception as e:
         log.exception("Ошибка конвертации в JPEG")
         await update.message.reply_text(f"❌ Не удалось конвертировать в JPEG: {e}")
@@ -217,8 +187,35 @@ async def handle_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         data = await upload_with_retries(jpeg_bytes, name=f"{the_id}.jpg", max_attempts=3)
+        context.user_data.pop("pending_image", None)
+        url = data.get("url")
+        size = data.get("size")
+        await update.message.reply_text(
+            (f"✅ Загружено!\nПрямая ссылка: {url}\nФайл: {the_id}.jpg\nРазмер: {size} байт")
+            if size else (f"✅ Загружено!\nПрямая ссылка: {url}\nФайл: {the_id}.jpg")
+        )
+        return
     except Exception as e:
-        await update.message.reply_text(f"❌ Загрузка в imgbb не удалась (даже JPEG): {e}")
+        log.warning("JPEG не удался, попробуем PNG. Причина: %s", e)
+
+    # --- Фоллбэк: PNG ---
+    try:
+        png_bytes = encode_png(pending, max_side=MAX_SIDE_PX)
+    except Exception as e:
+        log.exception("Ошибка конвертации в PNG")
+        await update.message.reply_text(f"❌ Не удалось конвертировать в PNG: {e}")
+        context.user_data.pop("pending_image", None)
+        return
+
+    if len(png_bytes) > IMGBB_MAX_BYTES:
+        await update.message.reply_text("❌ PNG > 32 МБ даже после даунскейла. Оставь JPEG или сожми.")
+        context.user_data.pop("pending_image", None)
+        return
+
+    try:
+        data = await upload_with_retries(png_bytes, name=f"{the_id}.png", max_attempts=2)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Загрузка в imgbb не удалась (PNG): {e}")
         context.user_data.pop("pending_image", None)
         return
 
@@ -226,8 +223,8 @@ async def handle_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = data.get("url")
     size = data.get("size")
     await update.message.reply_text(
-        (f"✅ Загружено!\nПрямая ссылка: {url}\nФайл: {the_id}.jpg\nРазмер: {size} байт")
-        if size else (f"✅ Загружено!\nПрямая ссылка: {url}\nФайл: {the_id}.jpg")
+        (f"✅ Загружено!\nПрямая ссылка: {url}\nФайл: {the_id}.png\nРазмер: {size} байт")
+        if size else (f"✅ Загружено!\nПрямая ссылка: {url}\nФайл: {the_id}.png")
     )
 
 # ---------- СБОРКА ----------

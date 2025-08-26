@@ -37,7 +37,7 @@ def sanitize_id(s: str) -> Optional[str]:
     return s if ID_RE.match(s) else None
 
 def bytes_to_png(original_bytes: bytes) -> bytes:
-    """Конвертирует любые поддерживаемые форматы (jpg, webp и т.п.) в PNG."""
+    """Конвертирует входное изображение в PNG."""
     with Image.open(io.BytesIO(original_bytes)) as im:
         if im.mode not in ("RGB", "RGBA", "P", "L"):
             im = im.convert("RGBA")
@@ -51,18 +51,30 @@ async def upload_to_imgbb(image_bytes: bytes, name: str) -> dict:
     url = "https://api.imgbb.com/1/upload"
     data = {"key": IMGBB_API_KEY, "image": b64_str, "name": name}
 
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, data=data, timeout=180) as resp:
-            txt = await resp.text()
-            payload = json.loads(txt)
-            if resp.status != 200 or not payload.get("success"):
-                raise RuntimeError(f"Ошибка imgbb: {txt}")
-            return payload["data"]
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data=data, timeout=180) as resp:
+                txt = await resp.text()
+                # 🔎 Логируем статус и начало ответа (до 500 символов)
+                log.info("imgbb response (status %s): %s", resp.status, txt[:500])
+
+                try:
+                    payload = json.loads(txt)
+                except json.JSONDecodeError:
+                    raise RuntimeError(f"imgbb вернул не-JSON. Ответ: {txt[:200]}")
+
+                if resp.status != 200 or not payload.get("success"):
+                    # У imgbb ошибки приходят как {"success":false,"error":{...}}
+                    err = payload.get("error") or {}
+                    raise RuntimeError(f"Ошибка imgbb: {err or payload}")
+                return payload["data"]
+    except aiohttp.ClientError as e:
+        raise RuntimeError(f"Сетевая ошибка при обращении к imgbb: {e}") from e
 
 # ---------- КОМАНДЫ ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! Отправь картинку, потом введи ID (например UZ001450). "
+        "Привет! Отправь картинку, затем введи ID (например UZ001450). "
         "Я загружу её в imgbb как UZ001450.png и пришлю прямую ссылку.\n\n"
         "/cancel — отменить ожидание кода."
     )
@@ -75,18 +87,18 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Принимаем картинку → сохраняем байты → просим ввести ID."""
     message = update.message
-    file = None
+    tg_file = None
 
     if message.photo:
-        file = await message.photo[-1].get_file()
-    elif message.document and message.document.mime_type.startswith("image/"):
-        file = await message.document.get_file()
+        tg_file = await message.photo[-1].get_file()
+    elif message.document and message.document.mime_type and message.document.mime_type.startswith("image/"):
+        tg_file = await message.document.get_file()
 
-    if not file:
+    if not tg_file:
         return
 
     buf = io.BytesIO()
-    await file.download_to_memory(out=buf)
+    await tg_file.download_to_memory(out=buf)
     image_bytes = buf.getvalue()
 
     if len(image_bytes) > IMGBB_MAX_BYTES:
@@ -104,22 +116,39 @@ async def handle_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     the_id = sanitize_id(update.message.text)
     if not the_id:
-        await update.message.reply_text("❌ Некорректный ID. Разрешены буквы/цифры/`_`/`-`.")
+        await update.message.reply_text("❌ Некорректный ID. Разрешены буквы/цифры/`_`/`-` (2–64 символа).")
         return
 
-    png_bytes = bytes_to_png(pending)
-    name = f"{the_id}.png"
+    try:
+        png_bytes = bytes_to_png(pending)
+    except Exception as e:
+        log.exception("Ошибка конвертации в PNG")
+        await update.message.reply_text(f"❌ Не удалось конвертировать изображение в PNG: {e}")
+        context.user_data.pop("pending_image", None)
+        return
 
+    if len(png_bytes) > IMGBB_MAX_BYTES:
+        await update.message.reply_text("❌ После конвертации PNG получилось больше 32 МБ. Сожми изображение и попробуй снова.")
+        context.user_data.pop("pending_image", None)
+        return
+
+    name = f"{the_id}.png"
     try:
         data = await upload_to_imgbb(png_bytes, name=name)
     except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
+        await update.message.reply_text(f"❌ Загрузка в imgbb не удалась: {e}")
         context.user_data.pop("pending_image", None)
         return
 
     context.user_data.pop("pending_image", None)
     url = data.get("url")
-    await update.message.reply_text(f"✅ Загружено!\nПрямая ссылка: {url}")
+    size = data.get("size")
+    await update.message.reply_text(
+        "✅ Загружено!\n"
+        f"Прямая ссылка: {url}\n"
+        f"Файл: {name}\n"
+        f"Размер: {size} байт" if size else f"✅ Загружено!\nПрямая ссылка: {url}\nФайл: {name}"
+    )
 
 # ---------- СБОРКА ----------
 def build_app() -> Application:
